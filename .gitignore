@@ -1,0 +1,15 @@
+# Folder lingkungan virtual
+.venv/
+venv/
+env/
+
+# Folder cache Python
+**/__pycache__/
+*.py[cod]
+
+# File rahasia (Sangat Penting!)
+.streamlit/secrets.toml
+
+# File sistem (opsional tapi disarankan)
+.DS_Store
+Thumbs.db

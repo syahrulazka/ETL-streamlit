@@ -27,7 +27,7 @@ def get_db_engine():
 def load_existing_keys(_engine):
     """Load existing employee_id and periode combinations as a set for fast lookup"""
     try:
-        query = "SELECT employee_id, DATE_FORMAT(periode, '%Y-%m-01') as periode FROM MasterTableNew_v2"
+        query = "SELECT employee_id, DATE_FORMAT(LAST_DAY(periode), '%Y-%m-%d') as periode FROM MasterTableNew_v2"
         df = pd.read_sql(query, _engine)
         return set(zip(df['employee_id'].astype(str), df['periode'].astype(str)))
     except Exception as e:
@@ -38,7 +38,7 @@ def load_existing_keys(_engine):
 def load_existing_non_mitra_keys(_engine):
     """Load existing employee_id and period combinations from non_mitra table"""
     try:
-        query = "SELECT employee_id, DATE_FORMAT(period, '%Y-%m-01') as period FROM non_mitra"
+        query = "SELECT employee_id, DATE_FORMAT(LAST_DAY(period), '%Y-%m-%d') as period FROM non_mitra"
         df = pd.read_sql(query, _engine)
         return set(zip(df['employee_id'].astype(str), df['period'].astype(str)))
     except Exception as e:
@@ -55,11 +55,47 @@ def get_hcm_engine():
     return create_engine(connection_string, connect_args={'ssl_disabled': True})
 
 @st.cache_data(ttl=600)
+def load_fte_history_data():
+    """Load FTE history data with resignation details from HCM"""
+    try:
+        hcm_engine = get_hcm_engine()
+        query = """
+        SELECT 
+            fh.meh_date,
+            fh.meh_employee_id,
+            CASE 
+                WHEN e.ME_END_DATE >= DATE_FORMAT(LAST_DAY(fh.meh_date), '%Y-%m-%d')
+                 AND e.ME_END_DATE <= LAST_DAY(fh.meh_date)
+                THEN e.ME_END_DATE
+                ELSE NULL
+            END AS ME_END_DATE,
+            rr.mrr_name AS reason_resign_name,
+            rrp.mrrp_name AS reason_resign_proint_name,
+            rrp.mrrp_category
+        FROM mst_fte_history fh
+        LEFT JOIN mst_employee e
+            ON fh.meh_employee_id = e.ME_EMPLOYEE_ID
+        LEFT JOIN mst_employee_resign r
+            ON fh.meh_employee_id = r.mer_employee_id
+            AND r.mer_eff_date >= DATE_FORMAT(LAST_DAY(fh.meh_date), '%Y-%m-%d')
+            AND r.mer_eff_date <= LAST_DAY(fh.meh_date)
+        LEFT JOIN mst_reason_resign rr
+            ON r.mer_reason_int = rr.mrr_id
+        LEFT JOIN mst_reason_resign_proint rrp
+            ON r.mer_reason_emp = rrp.mrrp_code
+        ORDER BY fh.meh_date
+        """
+        return pd.read_sql(query, hcm_engine)
+    except Exception as e:
+        st.error(f"Error loading FTE history data: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=600)
 def load_hcm_data():
     """Load HCM employee data"""
     try:
         hcm_engine = get_hcm_engine()
-        query = "SELECT ME_EMPLOYEE_ID, ME_JOB_LEVEL, ME_SEX, ME_BIRTH_DATE, ME_START_DATE, ME_END_DATE FROM mst_employee"
+        query = "SELECT ME_EMPLOYEE_ID, ME_JOB_LEVEL, ME_SEX, ME_BIRTH_DATE, ME_START_DATE FROM mst_employee"
         return pd.read_sql(query, hcm_engine)
     except Exception as e:
         st.error(f"Error loading HCM data: {e}")
@@ -132,7 +168,7 @@ def process_non_mitra_sheet(file, sheet_name):
             'Mitra': 'mitra', 'Location Code': 'location_code', 'Location Name': 'location_name',
             'Cost Code': 'cost_code', 'Cost Name': 'cost_name', 'BU Code': 'bu_code',
             'BU': 'bu_1', 'Org Code': 'org_code', 'Dept': 'dept', 'Gender': 'gender',
-            'Birth Date': 'birth_date', 'Join Date': 'join_date', 'Terminate Date': 'terminate_date',
+            'Birth Date': 'birth_date', 'Join Date': 'join_date',
             'Jenis Karyawan': 'jenis_karyawan', 'Basic Salary': 'basic_salary', 'BU.1': 'bu_2',
             'New Location By CC': 'new_location_by_cc', 'Teritory Name': 'territory_name',
             'Section': 'section', 'HO/Non HO': 'ho_non_ho', 'HO/Store': 'ho_store',
@@ -142,12 +178,12 @@ def process_non_mitra_sheet(file, sheet_name):
         
         df.dropna(axis=0, how='all', inplace=True)
         
-        # Add '01-' prefix and convert period to datetime
-        df['period'] = '01-' + df['period'].astype(str)
-        df['period'] = pd.to_datetime(df['period'], format='%d-%b %y', errors='coerce')
+        # Convert period to datetime and set to last day of month
+        df['period'] = pd.to_datetime(df['period'], format='%b %y', errors='coerce')
+        df['period'] = df['period'] + pd.offsets.MonthEnd(0)
         
         # Convert date columns
-        date_cols = ['birth_date', 'join_date', 'terminate_date']
+        date_cols = ['birth_date', 'join_date']
         for col in date_cols:
             df[col] = pd.to_datetime(df[col], errors='coerce')
         
@@ -228,8 +264,7 @@ def merge_with_hcm(df):
     df_merged.rename(columns={
         'ME_SEX': 'Gender',
         'ME_BIRTH_DATE': 'Birth Date',
-        'ME_JOB_LEVEL': 'Job Level',
-        'ME_END_DATE': 'Terminate Date'
+        'ME_JOB_LEVEL': 'Job Level'
     }, inplace=True)
     
     df_merged['Join Date'] = df_merged['ME_START_DATE']
@@ -238,13 +273,92 @@ def merge_with_hcm(df):
     
     return df_merged
 
+def merge_with_fte_history(df, is_non_mitra=False):
+    """Merge employee data with FTE history (meh_date/meh_employee_id with periode/employee_id)"""
+    try:
+        fte_history = load_fte_history_data()
+        if fte_history.empty:
+            return df
+
+        # Normalize fte_history keys and dates
+        fte_history['meh_employee_id'] = fte_history['meh_employee_id'].astype(str).str.strip()
+        fte_history['meh_date'] = pd.to_datetime(fte_history['meh_date'], errors='coerce')
+
+        if is_non_mitra:
+            # For non_mitra: join on employee_id and period (month period)
+            df['period'] = pd.to_datetime(df['period'], errors='coerce')
+            df['employee_id'] = df['employee_id'].astype(str).str.strip()
+
+            df['_merge_period'] = df['period'].dt.to_period('M')
+            fte_history['_merge_period'] = fte_history['meh_date'].dt.to_period('M')
+
+            df_merged = pd.merge(
+                df, fte_history, how='left',
+                left_on=['employee_id', '_merge_period'],
+                right_on=['meh_employee_id', '_merge_period']
+            )
+
+            df_merged.drop('_merge_period', axis=1, inplace=True)
+        else:
+            # For internal/mitra: join on Employee ID and Periode (month period)
+            df['Periode'] = pd.to_datetime(df['Periode'], format='%b %y', errors='coerce')
+            df['Employee ID'] = df['Employee ID'].astype(str).str.strip()
+
+            df['_merge_period'] = df['Periode'].dt.to_period('M')
+            fte_history['_merge_period'] = fte_history['meh_date'].dt.to_period('M')
+
+            df_merged = pd.merge(
+                df, fte_history, how='left',
+                left_on=['Employee ID', '_merge_period'],
+                right_on=['meh_employee_id', '_merge_period']
+            )
+
+            df_merged.drop('_merge_period', axis=1, inplace=True)
+
+        return df_merged
+    except Exception as e:
+        st.error(f"Error merging with FTE history: {e}")
+        return df
+
 def finalize_data(df, file_type):
-    """Finalize data structure"""
+    """Finalize data structure with all required columns including FTE history"""
     final_cols = [
         'Periode', 'Employee ID', 'Employee Name', 'Join Date', 'EmpType',
         'Job Title', 'Organization Code', 'BU', 'New Location By CC', 'Teritory',
         'CC Code', 'Status', 'GroupingEmployeeType', 'Internal/Mitra',
-        'Gender', 'Birth Date', 'Job Level', 'Terminate Date'
+        'Gender', 'Birth Date', 'Job Level', 'meh_date', 'meh_employee_id',
+        'ME_END_DATE', 'reason_resign_name', 'reason_resign_proint_name', 'mrrp_category'
+    ]
+    
+    for col in final_cols:
+        if col not in df.columns:
+            df[col] = None
+    
+    df = df[final_cols].copy()
+    
+    # Convert dates and set to last day of month
+    df['Periode'] = pd.to_datetime(df['Periode'], format='%b %y', errors='coerce')
+    df['Periode'] = df['Periode'] + pd.offsets.MonthEnd(0)
+    for col in ['Join Date', 'Birth Date', 'meh_date', 'ME_END_DATE']:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+    
+    # Standardize employee types
+    df.loc[df['GroupingEmployeeType'] == 'PKWTT', 'GroupingEmployeeType'] = 'Permanent'
+    df.loc[df['GroupingEmployeeType'] == 'PKWT', 'GroupingEmployeeType'] = 'Contract'
+    
+    # For Mitra, set Job Level to None
+    if file_type == "Mitra":
+        df['Job Level'] = None
+    return df
+
+def finalize_non_mitra_data(df):
+    """Finalize non_mitra data structure with all required columns"""
+    final_cols = [
+        'employee_id', 'period', 'id_card', 'pin', 'full_name', 'job_title',
+        'mitra', 'location_code', 'location_name', 'cost_code', 'cost_name',
+        'bu_code', 'bu_1', 'org_code', 'dept', 'gender', 'birth_date',
+        'join_date', 'jenis_karyawan', 'basic_salary', 'bu_2', 'new_location_by_cc',
+        'territory_name', 'section', 'ho_non_ho', 'ho_store', 'bu_supporting'
     ]
     
     for col in final_cols:
@@ -254,29 +368,22 @@ def finalize_data(df, file_type):
     df = df[final_cols].copy()
     
     # Convert dates
-    df['Periode'] = pd.to_datetime(df['Periode'], format='%b %y', errors='coerce')
-    for col in ['Join Date', 'Birth Date', 'Terminate Date']:
+    for col in ['period', 'join_date', 'birth_date']:
         df[col] = pd.to_datetime(df[col], errors='coerce')
     
-    # Standardize employee types
-    df.loc[df['GroupingEmployeeType'] == 'PKWTT', 'GroupingEmployeeType'] = 'Permanent'
-    df.loc[df['GroupingEmployeeType'] == 'PKWT', 'GroupingEmployeeType'] = 'Contract'
-    
-    # For Mitra, set Job Level and Terminate Date to None
-    if file_type == "Mitra":
-        df['Job Level'] = None
-        df['Terminate Date'] = None
+    # Convert basic_salary to numeric
+    df['basic_salary'] = pd.to_numeric(df['basic_salary'], errors='coerce')
     
     return df
 
 def filter_new_records(df, existing_keys, is_non_mitra=False):
     """Filter out duplicate records based on employee_id and periode/period"""
     if is_non_mitra:
-        df['_check_key'] = df['employee_id'].astype(str) + '_' + df['period'].dt.strftime('%Y-%m-01')
+        df['_check_key'] = df['employee_id'].astype(str) + '_' + df['period'].dt.to_period('M').dt.to_timestamp(freq='M', how='end').dt.strftime('%Y-%m-%d')
     else:
-        df['_check_key'] = df['Employee ID'].astype(str) + '_' + df['Periode'].dt.strftime('%Y-%m-01')
+        df['_check_key'] = df['Employee ID'].astype(str) + '_' + df['Periode'].dt.to_period('M').dt.to_timestamp(freq='M', how='end').dt.strftime('%Y-%m-%d')
     
-    new_records = df[~df['_check_key'].isin([f"{k[0]}_{k[1]}" for k in existing_keys])].copy()
+    new_records = df[~df['_check_key'].isin([str(k[0]) + '_' + str(k[1]) for k in existing_keys])].copy()
     new_records.drop('_check_key', axis=1, inplace=True)
     return new_records
 
@@ -286,21 +393,38 @@ def insert_to_database(df, engine, table_name='MasterTableNew_v2'):
         if table_name == 'non_mitra':
             # Non Mitra specific dtype mapping
             dtype_map = {
-                "employee_id": String(50), "period": Date(), "id_card": String(50),
-                "pin": String(20), "full_name": String(255), "job_title": String(100),
-                "mitra": String(100), "location_code": String(50), "location_name": String(100),
-                "cost_code": String(50), "cost_name": String(100), "bu_code": String(50),
-                "bu_1": String(100), "org_code": String(50), "dept": String(100),
-                "gender": String(10), "birth_date": Date(), "join_date": Date(),
-                "terminate_date": Date(), "jenis_karyawan": String(50), "bu_2": String(100),
-                "new_location_by_cc": String(100), "territory_name": String(100),
-                "section": String(100), "ho_non_ho": String(50), "ho_store": String(50),
-                "bu_supporting": String(100)
+                "employee_id": String(50),
+                "period": Date(),
+                "id_card": String(50),
+                "pin": String(50),
+                "full_name": String(255),
+                "job_title": String(255),
+                "mitra": String(255),
+                "location_code": String(50),
+                "location_name": String(255),
+                "cost_code": String(50),
+                "cost_name": String(255),
+                "bu_code": String(50),
+                "bu_1": String(255),
+                "org_code": String(50),
+                "dept": String(255),
+                "gender": String(50),
+                "birth_date": Date(),
+                "join_date": Date(),
+                "jenis_karyawan": String(50),
+                "basic_salary": String(50),
+                "bu_2": String(255),
+                "new_location_by_cc": String(255),
+                "territory_name": String(255),
+                "section": String(255),
+                "ho_non_ho": String(50),
+                "ho_store": String(50),
+                "bu_supporting": String(255)
             }
             df.to_sql(table_name, con=engine, if_exists='append', 
                      index=False, dtype=dtype_map, chunksize=1000)
         else:
-            # MasterTableNew_v2 dtype mapping
+            # MasterTableNew_v2 dtype mapping with FTE history columns
             df_sql = df.rename(columns=lambda x: x.strip().replace(" ", "_").replace("/", "_").replace("-", "_").lower())
             
             dtype_map = {
@@ -308,8 +432,10 @@ def insert_to_database(df, engine, table_name='MasterTableNew_v2'):
                 "job_title": String(255), "organization_code": String(50), "bu": String(100),
                 "new_location_by_cc": String(255), "teritory": String(255), "cc_code": String(50),
                 "status": String(50), "groupingemployeetype": String(100), "internal_mitra": String(50),
-                "gender": String(20), "job_level": String(50),
-                "periode": Date(), "join_date": Date(), "birth_date": Date(), "terminate_date": Date(),
+                "gender": String(20), "job_level": String(50), "periode": Date(), "join_date": Date(),
+                "birth_date": Date(), "meh_date": Date(), "meh_employee_id": String(50),
+                "me_end_date": Date(), "reason_resign_name": String(255),
+                "reason_resign_proint_name": String(255), "mrrp_category": String(100)
             }
             
             df_sql.to_sql(table_name, con=engine, if_exists='append', 
@@ -354,7 +480,8 @@ def main():
                 
                 for idx, (df, sheet_name, sheet_type) in enumerate(zip(dfs, sheet_names, sheet_types)):
                     if sheet_type == 'non_mitra':
-                        # Process Non Mitra (no HCM merge, no finalize)
+                        # Process Non Mitra: no FTE history merge needed
+                        df = finalize_non_mitra_data(df)
                         new_records = filter_new_records(df, existing_non_mitra_keys, is_non_mitra=True)
                         if len(new_records) > 0:
                             all_new_records.append((new_records, sheet_name, sheet_type))
@@ -363,6 +490,9 @@ def main():
                         # Only merge with HCM for Internal Employee and Mitra N
                         if file_type == "Internal Employee" or sheet_name == "Mitra N":
                             df = merge_with_hcm(df)
+                        
+                        # Merge with FTE history for all mitra/internal
+                        df = merge_with_fte_history(df, is_non_mitra=False)
                         
                         df = finalize_data(df, file_type)
                         new_records = filter_new_records(df, existing_keys, is_non_mitra=False)
@@ -378,7 +508,7 @@ def main():
                     # Display each sheet separately
                     for new_records, sheet_name, sheet_type in all_new_records:
                         st.write(f"**{sheet_name}: {len(new_records)} new records**")
-                        st.dataframe(new_records, use_container_width=True, height=400)
+                        st.dataframe(new_records, width='stretch', height=400)
                     
                     if st.button("Insert All New Records to Database", type="primary", use_container_width=True):
                         with st.spinner("Inserting data..."):

@@ -2,28 +2,7 @@
 
 A Streamlit-based web application for uploading and managing employee data into multiple database tables. The system supports internal employees, mitra (contractor/partner) employees, and non-mitra employees with automated data validation, merging with HCM systems, and FTE history tracking.
 
-## Table of Contents
 
-- [Features](#features)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Database Structure](#database-structure)
-- [Data Processing Flow](#data-processing-flow)
-- [Column Mappings](#column-mappings)
-- [Architecture](#architecture)
-
-## Features
-
-- **Multiple Employee Types**: Support for Internal Employee, Mitra, Mitra N, and Non-Mitra data
-- **Data Validation**: Automatic detection and prevention of duplicate records
-- **HCM Integration**: Merges employee data with HCM database for enriched information
-- **FTE History Tracking**: Integrates FTE history and resignation details from HCM (for Internal/Mitra employees)
-- **Period Standardization**: Automatically converts all periods to the last day of the month for consistency
-- **Batch Processing**: Handles multiple sheets and thousands of records with chunk insertion
-- **Real-time Feedback**: Shows preview of new records before database insertion
-- **Caching**: Uses Streamlit caching for improved performance on repeated queries
 
 ## Requirements
 

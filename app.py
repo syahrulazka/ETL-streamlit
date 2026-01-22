@@ -448,6 +448,25 @@ def insert_to_database(df, engine, table_name='MasterTableNew_v2'):
 def main():
     st.title("Employee Data Upload System")
     st.markdown("Upload employee data to insert new records into the database.")
+    
+    # Membuat kolom untuk membatasi lebar tombol agar tidak terlalu besar
+    # [1, 4] berarti tombol hanya mengambil 1/5 lebar layar (20%)
+    col_btn, col_spacer = st.columns([1, 4])
+    
+    with col_btn:
+        download_template_file_path = "template-employee-data.xlsx"
+        try:
+            with open(download_template_file_path, "rb") as f:
+                st.download_button(
+                    label="Download Template",
+                    data=f,
+                    file_name="template-employee-data.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True # Mengikuti lebar kolom [1] saja
+                )
+        except FileNotFoundError:
+            st.error("Template not found")
+
     st.divider()
     
     engine = get_db_engine()
